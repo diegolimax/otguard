@@ -133,6 +133,7 @@ wizard() {
   [ -t 0 ] || die "o assistente e interativo — rode a partir do arquivo (sh otguard.sh), nao por pipe."
   command -v whiptail >/dev/null 2>&1 || die "whiptail nao instalado.  Rode:  sudo apt install whiptail"
 
+  WZ_N=9
   defif=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
   sship=$(printf '%s' "${SSH_CLIENT:-}" | awk '{print $1}')
 
@@ -149,7 +150,7 @@ OVH VAC, NEEP/ShieldM, Hetzner DDoS Protection).
 Ataque maior que sua banda satura na borda do datacenter
 antes de chegar aqui — isso so se resolve la fora.
 
-Vou te fazer 8 perguntas rapidas. Use:
+Vou te fazer 9 perguntas rapidas. Use:
   TAB / setas / SPACE / ENTER  para navegar.
 A resposta sugerida ja vem preenchida em cada tela."
 
@@ -162,22 +163,22 @@ A resposta sugerida ja vem preenchida em cada tela."
     fi
   done
   [ "$#" = 0 ] && set -- eth0 "eth0 (padrao)" on
-  W_IFACE=$(whiptail --backtitle "$WT_BACK" --title "1/8  Interface de rede" \
+  W_IFACE=$(whiptail --backtitle "$WT_BACK" --title "1/9  Interface de rede" \
     --radiolist "Em qual placa de rede o servidor de OT escuta?\n\n(o OTGuard ja detectou a default da sua VM)" \
     16 70 6 "$@" 3>&1 1>&2 2>&3) || wt_cancel
 
   # 2) Porta de login
-  wt_input "2/8  Porta de login do OT" \
+  wt_input "2/9  Porta de login do OT" \
     "Porta de LOGIN do servidor (padrao do Tibia/OT: 7171):" "7171"
   W_PL=$ANS
 
   # 3) Porta de jogo
-  wt_input "3/8  Porta de jogo do OT" \
+  wt_input "3/9  Porta de jogo do OT" \
     "Porta de JOGO do servidor (padrao do Tibia/OT: 7172):" "7172"
   W_PG=$ANS
 
   # 4) Admin IPs
-  wt_input "4/8  Acesso de administrador" \
+  wt_input "4/9  Acesso de administrador" \
 "IP(s) com acesso livre as portas do jogo (e ao site quando o filtro CF estiver ligado).
 Separe com espaco se forem varios.
 
@@ -187,7 +188,7 @@ IP dinamico ou CGNAT?  Deixe vazio e acesse o phpmyadmin pelo dominio
   W_ADM=$ANS
 
   # 5) Provedor
-  W_PROV=$(whiptail --backtitle "$WT_BACK" --title "5/8  Provedor de hospedagem" \
+  W_PROV=$(whiptail --backtitle "$WT_BACK" --title "5/9  Provedor de hospedagem" \
     --radiolist "Onde o servidor esta hospedado?\n\n(o OTGuard usa isso pra te dizer o que pedir ao suporte do provedor quando levar um ataque)" \
     18 70 5 \
     1 "NEEP / ShieldM"              on  \
@@ -198,14 +199,14 @@ IP dinamico ou CGNAT?  Deixe vazio e acesse o phpmyadmin pelo dominio
     3>&1 1>&2 2>&3) || wt_cancel
 
   # 6) Discord
-  wt_input "6/8  Alertas no Discord  (opcional)" \
+  wt_input "6/9  Alertas no Discord  (opcional)" \
 "Cole a URL do webhook do Discord para receber alerta quando um ataque chegar.
 
 Deixe vazio se nao quiser usar." ""
   W_HOOK=$ANS
 
   # 7) Cloudflare
-  if wt_yesno "7/8  Protecao do site (Cloudflare)" \
+  if wt_yesno "7/9  Protecao do site (Cloudflare)" \
 "Seu site (portas 80/443) fica atras da Cloudflare NESTA mesma VM?
 
 SIM  →  o OTGuard libera 80/443 so para a Cloudflare e bloqueia o resto.
@@ -216,12 +217,30 @@ NAO  →  o OTGuard nao toca em 80/443.
 ATENCAO: marque SIM apenas se o site usa Cloudflare DE VERDADE.
 Senao ele sai do ar." "n"; then W_CF=sim; else W_CF=nao; fi
 
-  # 8) Pico de players
-  wt_input "8/8  Tamanho do servidor" \
-"Pico estimado de players online (serve so para calibrar os limites anti-flood):" \
+  # 8) Pico de chars online (total — calibra PPS / conntrack globais)
+  wt_input "8/9  Tamanho do servidor" \
+"Pico estimado de PERSONAGENS online (numero que aparece em
+'online' no server, contando todos os chars de todos os players).
+
+Calibra os limites globais de pps e conntrack." \
     "500"
   W_PEAK=$ANS
   case $W_PEAK in *[!0-9]*|'') W_PEAK=500 ;; esac
+
+  # 9) Chars por IP (calibra limites por origem)
+  wt_input "9/9  Chars por IP" \
+"Quantos personagens 1 jogador pode logar do MESMO IP simultaneamente?
+
+  Tibia oficial:  1
+  OT comum:       2 - 4
+  OT permissivo:  10 - 50+
+
+Calibra o anti-SYN-flood por origem. Sem isso, um jogador
+legitimo logando muitos chars seria barrado como atacante." \
+    "4"
+  W_CHARS_PER_IP=$ANS
+  case $W_CHARS_PER_IP in *[!0-9]*|'') W_CHARS_PER_IP=4 ;; esac
+  [ "$W_CHARS_PER_IP" -lt 1 ] && W_CHARS_PER_IP=1
 
   provider_info "$W_PROV"
 
@@ -236,23 +255,35 @@ Senao ele sai do ar." "n"; then W_CF=sim; else W_CF=nao; fi
   Provedor:     $PROV_NAME
   Discord:      $([ -n "$W_HOOK" ] && echo \"configurado\" || echo \"nao configurado\")
   Cloudflare:   $W_CF
-  Pico players: $W_PEAK
+  Pico chars:   $W_PEAK
+  Chars/IP:     $W_CHARS_PER_IP
 
-Confirmar e instalar?" 20 70 || wt_cancel
+Confirmar e instalar?" 22 70 || wt_cancel
 }
 
 # --------------------------------------------------------------------------
 write_config() {
   mkdir -p "$CONF_DIR"
-  # calibragem: assume ~50 pkt/s por player (Tibia PvP/PvM ativo).
+  # calibragem PPS: assume ~50 pkt/s por player (Tibia PvP/PvM ativo).
   # Validado em campo: server de 630 players ~25k pps reais; players*50 ~= 31500.
   norm=$(( W_PEAK * 50 ))                       # trafego "normal de pico" estimado
-  # WARNING: 2x normal — algo subindo, fica de olho
-  w_pps=$(( norm * 2 ));   [ "$w_pps"   -lt 5000  ] && w_pps=5000
-  # ATTACK: 4x normal — quase certeza de flood
-  a_pps=$(( norm * 4 ));   [ "$a_pps"   -lt 15000 ] && a_pps=15000
-  # captura (watch.sh dispara pcap): 3x normal — entre warning e attack
-  pps_lim=$(( norm * 3 )); [ "$pps_lim" -lt 10000 ] && pps_lim=10000
+  w_pps=$(( norm * 2 ));   [ "$w_pps"   -lt 5000  ] && w_pps=5000     # WARN: 2x normal
+  a_pps=$(( norm * 4 ));   [ "$a_pps"   -lt 15000 ] && a_pps=15000    # ATAQUE: 4x normal
+  pps_lim=$(( norm * 3 )); [ "$pps_lim" -lt 10000 ] && pps_lim=10000  # captura: 3x normal
+  # calibragem CONNTRACK: ~3 conexoes TCP por char (login + jogo + buffer).
+  ct_norm=$(( W_PEAK * 3 ))
+  w_ct=$(( ct_norm * 5  )); [ "$w_ct"   -lt 1000 ] && w_ct=1000       # WARN:  5x normal
+  a_ct=$(( ct_norm * 10 )); [ "$a_ct"   -lt 5000 ] && a_ct=5000       # ATAQUE: 10x normal
+  ct_lim=$(( ct_norm * 7 )); [ "$ct_lim" -lt 4000 ] && ct_lim=4000    # captura: 7x normal
+  # SYN-flood GLOBAL (dst port): pico de logins simultaneos depende dos chars totais.
+  # Estimativa: pico de logins ~= chars/2 por segundo (server reabrindo, evento etc.)
+  syn_g_rate=$(( W_PEAK / 2 ));  [ "$syn_g_rate"  -lt 150 ] && syn_g_rate=150
+  syn_g_burst=$(( syn_g_rate * 2 ))
+  # SYN-flood POR IP (srcip): depende de chars_per_ip — 1 jogador pode logar varios chars do mesmo IP.
+  # Rate sustentada: chars_per_ip * 10/min (reconnects normais).
+  # Burst: chars_per_ip * 3 (margem p/ login em rajada de todos os chars de uma vez).
+  syn_p_rate=$(( W_CHARS_PER_IP * 10 ));  [ "$syn_p_rate"  -lt 30 ] && syn_p_rate=30
+  syn_p_burst=$(( W_CHARS_PER_IP * 3 ));  [ "$syn_p_burst" -lt 20 ] && syn_p_burst=20
   ( umask 077; cat > "$CONF" <<OTG_CONF
 # OTGuard $OTG_VER — gerado em $(date -Is)
 IFACE=$W_IFACE
@@ -266,9 +297,17 @@ PROVIDER_ASK="$PROV_ASK"
 DISCORD_WEBHOOK="$W_HOOK"
 CF_FILTER=$W_CF
 WEB_PORTS_CSV=80,443
-# captura + alerta (tibia-ddos-watch)
+# guardado p/ futuras upgrades recalibrarem thresholds sem refazer o wizard
+PEAK_PLAYERS=$W_PEAK
+CHARS_PER_IP=$W_CHARS_PER_IP
+# limites de SYN-flood (calculados a partir de PEAK_PLAYERS + CHARS_PER_IP)
+SYN_GLOBAL_RATE=$syn_g_rate
+SYN_GLOBAL_BURST=$syn_g_burst
+SYN_PER_IP_RATE=$syn_p_rate
+SYN_PER_IP_BURST=$syn_p_burst
+# captura + alerta (watch.sh)
 PPS_LIMIT=$pps_lim
-CT_LIMIT=40000
+CT_LIMIT=$ct_lim
 SYN_LIMIT=300
 NEED_HITS=2
 COOLDOWN=900
@@ -281,8 +320,8 @@ INTERVAL=10
 # cores do monitor (otguard-mon)
 A_PPS=$a_pps
 W_PPS=$w_pps
-A_CT=40000
-W_CT=8000
+A_CT=$a_ct
+W_CT=$w_ct
 A_SYN=400
 W_SYN=40
 A_HO=300
@@ -310,10 +349,13 @@ for a in $ADMIN_IPS; do
 done
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" -m set --match-set otguard_bl src -j DROP
 iptables -t raw -A PREROUTING -p udp -m multiport --dports "$PORTS_CSV" -j DROP
+# limites SYN — calculados em write_config a partir de PEAK_PLAYERS e CHARS_PER_IP
+SGR=${SYN_GLOBAL_RATE:-150};  SGB=${SYN_GLOBAL_BURST:-300}
+SPR=${SYN_PER_IP_RATE:-30};   SPB=${SYN_PER_IP_BURST:-40}
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m hashlimit \
-  --hashlimit-name otg_g --hashlimit-mode dstport --hashlimit-above 150/sec --hashlimit-burst 200 -j DROP
+  --hashlimit-name otg_g --hashlimit-mode dstport --hashlimit-above "${SGR}/sec" --hashlimit-burst "$SGB" -j DROP
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m hashlimit \
-  --hashlimit-name otg_s --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above 30/min --hashlimit-burst 40 -j DROP
+  --hashlimit-name otg_s --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above "${SPR}/min" --hashlimit-burst "$SPB" -j DROP
 # protecao do site: 80/443 so da Cloudflare (opcional, com fail-safe)
 ip6tables -t raw -F PREROUTING 2>/dev/null
 if [ "$CF_FILTER" = sim ]; then
@@ -930,6 +972,42 @@ selftest() {
 }
 
 # --------------------------------------------------------------------------
+# upgrade — redeploya os componentes (e recalcula thresholds se houver
+# PEAK_PLAYERS no config). Chamado automaticamente pelo postinst do .deb
+# em upgrades, ou manualmente: `sudo otguard upgrade`.
+upgrade() {
+  [ "$(id -u)" = 0 ] || die "rode como root"
+  [ -f "$CONF" ]    || die "OTGuard nao instalado ainda — use 'sudo otguard' pra primeira vez"
+  . "$CONF"
+  say ""
+  say "  ${CT}OTGuard upgrade${CR} -> versao $OTG_VER"
+  hr
+  if [ -n "${PEAK_PLAYERS:-}" ]; then
+    say "  ${CD}recomputando thresholds (PEAK_PLAYERS=$PEAK_PLAYERS, CHARS_PER_IP=${CHARS_PER_IP:-4})${CR}"
+    # remonta os W_* a partir do config — write_config precisa deles
+    W_IFACE=$IFACE
+    W_PL=$(printf '%s' "$PORTS" | awk '{print $1}')
+    W_PG=$(printf '%s' "$PORTS" | awk '{print $2}')
+    W_ADM=$ADMIN_IPS
+    W_HOOK=$DISCORD_WEBHOOK
+    W_CF=$CF_FILTER
+    W_PEAK=$PEAK_PLAYERS
+    W_CHARS_PER_IP=${CHARS_PER_IP:-4}    # fallback p/ configs antigas (pre-1.2)
+    PROV_KEY=$PROVIDER; PROV_NAME=$PROVIDER_NAME
+    SCRUB=$SCRUB_NAME;  PROV_ASK=$PROVIDER_ASK
+    write_config
+    ok "config regenerada com thresholds da v$OTG_VER"
+  else
+    warn "config sem PEAK_PLAYERS (instalada antes da v1.1)"
+    warn "vou apenas redeployar os componentes."
+    warn "rode  ${CT}sudo otguard reconfig${CR}  ${CW}depois${CR} para recalibrar os limites com a formula nova."
+  fi
+  say "  ${CD}redeployando componentes (scripts em /usr/local/sbin, units systemd)...${CR}"
+  apply
+  ok "OTGuard atualizado para v$OTG_VER."
+}
+
+# --------------------------------------------------------------------------
 # build_deb — empacota o proprio script num .deb (Architecture: all).
 # Uso:  sh otguard.sh --build-deb [versao]
 build_deb() {
@@ -969,9 +1047,21 @@ CTRL
   cat > "$tmp/$pkg/DEBIAN/postinst" <<'POST'
 #!/bin/sh
 set -e
+# $1 = "configure"
+# $2 = versao ANTIGA quando e upgrade; vazio em primeira instalacao
 case "$1" in
   configure)
-    cat <<MSG
+    if [ -n "$2" ] && [ -f /etc/otguard/otguard.conf ]; then
+      # upgrade: redeploya componentes e recalcula thresholds (se PEAK_PLAYERS presente)
+      echo
+      echo "  detectado upgrade de v${2} -> nova versao"
+      echo "  rodando 'otguard upgrade' automaticamente..."
+      /usr/sbin/otguard upgrade || {
+        echo "  (falhou — rode manualmente: sudo otguard upgrade)"
+        exit 0   # nao bloqueia o upgrade do .deb
+      }
+    else
+      cat <<MSG
 
   OTGuard instalado.  Para configurar (wizard interativo):
 
@@ -980,6 +1070,7 @@ case "$1" in
   Outros comandos:  otguard help
 
 MSG
+    fi
     ;;
 esac
 exit 0
@@ -1036,6 +1127,7 @@ case "${1:-}" in
   reconfig|--reconfig)   [ "$(id -u)" = 0 ] || die "rode como root"
                          [ -f "$CONF" ] || die "OTGuard nao instalado"
                          . "$CONF"; wizard; write_config; apply; ok "reconfigurado." ;;
+  upgrade|--upgrade)     upgrade ;;
   uninstall|--uninstall) [ "$(id -u)" = 0 ] || die "rode como root"; uninstall ;;
   selftest|--selftest)   selftest ;;
   build-deb|--build-deb) shift; build_deb "$@" ;;
