@@ -18,6 +18,8 @@
 #    otguard banlist         lista os IPs bloqueados
 #    otguard test            envia mensagem de teste ao Discord
 #    otguard reconfig        roda o assistente de novo
+#    otguard upgrade         redeploya componentes + recalibra thresholds
+#                            (chamado sozinho pelo postinst em upgrades de .deb)
 #    otguard uninstall       remove tudo
 #    otguard --selftest      valida o pacote sem instalar nada
 #
@@ -640,7 +642,11 @@ send_snapshot() {
   fi
   sent_at=$SECONDS
 }
-TOP=$(printf '%b┌─ %b%s %b%s┐%b' "$BORD" "$TITLE" 'OTGuard · monitor de trafego' "$BORD" "$(hrule ─ 39)" "$RST")
+# OTG_VER e substituido pelo emit_scripts no momento da geracao do .deb / instalacao
+OTG_VER='__OTG_VER__'
+title="OTGuard v${OTG_VER} · monitor de trafego"
+dashes=$(( 67 - ${#title} )); [ "$dashes" -lt 4 ] && dashes=4
+TOP=$(printf '%b┌─ %b%s %b%s┐%b' "$BORD" "$TITLE" "$title" "$BORD" "$(hrule ─ "$dashes")" "$RST")
 SEP=$(printf '%b├%s┤%b' "$BORD" "$(hrule ─ 70)" "$RST")
 BOT=$(printf '%b└%s┘%b' "$BORD" "$(hrule ─ 70)" "$RST")
 printf '\033[2J\033[?25l'
@@ -693,6 +699,8 @@ while :; do
   else sleep 1; fi
 done
 OTG_MON
+  # substitui placeholders dependentes da versao em runtime (heredoc 'quoted' nao expande)
+  sed -i "s/__OTG_VER__/$OTG_VER/g" "$bd/otguard-mon"
   chmod +x "$sd/otguard-mitigacao.sh" "$sd/otguard-cf-update.sh" "$sd/otguard-watch.sh" "$sd/otguard-live.sh" "$bd/otguard-mon"
 }
 
@@ -786,12 +794,32 @@ OTG_SYS
   else
     systemctl disable --now otguard-cfupdate.timer >/dev/null 2>&1
   fi
-  # instala o proprio script como comando global "otguard" (qualquer pasta)
-  if [ -f "$0" ]; then
-    cp -f "$0" /usr/local/sbin/otguard 2>/dev/null
-    chmod 0755 /usr/local/sbin/otguard 2>/dev/null
+  # instala o proprio script como comando global "otguard" em qualquer PATH.
+  #
+  # Caso A: existe /usr/sbin/otguard (instalado via .deb) — esse e o canonico.
+  #   Removemos /usr/local/sbin/otguard se ele existir (raw install antigo),
+  #   porque PATH coloca /usr/local/sbin antes e ele eclipsaria o .deb.
+  #   Criamos um symlink em /usr/local/bin pra "otguard" funcionar pra usuario
+  #   normal tambem (alguns Ubuntu nao botam /usr/sbin no PATH de user comum).
+  #
+  # Caso B: nao existe /usr/sbin/otguard — instalacao via raw 'sh otguard.sh'.
+  #   Copiamos $0 pra /usr/local/sbin/otguard.
+  if [ -x /usr/sbin/otguard ]; then
+    if [ -e /usr/local/sbin/otguard ] && [ "$(readlink -f /usr/local/sbin/otguard 2>/dev/null)" != "/usr/sbin/otguard" ]; then
+      rm -f /usr/local/sbin/otguard
+      ok 'limpou /usr/local/sbin/otguard antigo (cano canonico agora e /usr/sbin/otguard do .deb)'
+    fi
+    ln -sf /usr/sbin/otguard /usr/local/bin/otguard
+  elif [ -f "$0" ]; then
+    # comparar inodes p/ evitar cp 'X X' quando $0 ja e o destino
+    src_i=$(stat -c %i "$0" 2>/dev/null)
+    dst_i=$(stat -c %i /usr/local/sbin/otguard 2>/dev/null)
+    if [ -n "$src_i" ] && [ "$src_i" != "$dst_i" ]; then
+      cp -f "$0" /usr/local/sbin/otguard
+      chmod 0755 /usr/local/sbin/otguard
+      ok 'comando global: digite "otguard" em qualquer lugar'
+    fi
     ln -sf /usr/local/sbin/otguard /usr/local/bin/otguard
-    ok 'comando global: digite "otguard" em qualquer lugar'
   fi
 }
 
@@ -1019,6 +1047,9 @@ build_deb() {
   tmp=$(mktemp -d) || die "mktemp falhou"
   mkdir -p "$tmp/$pkg/DEBIAN" "$tmp/$pkg/usr/sbin"
   cp "$0" "$tmp/$pkg/usr/sbin/otguard"
+  # substitui OTG_VER no script empacotado pela versao real do .deb
+  # (assim 'otguard' / 'otguard help' / status banner mostram a versao certa)
+  sed -i "s/^OTG_VER=.*/OTG_VER=$ver/" "$tmp/$pkg/usr/sbin/otguard"
   chmod 0755 "$tmp/$pkg/usr/sbin/otguard"
   cat > "$tmp/$pkg/DEBIAN/control" <<CTRL
 Package: otguard
