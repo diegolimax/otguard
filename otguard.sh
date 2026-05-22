@@ -28,7 +28,7 @@
 #
 #  Dica: digite "ot" e TAB para autocompletar (otguard / otguard-mon).
 # ==========================================================================
-OTG_VER=1.0
+OTG_VER=1.5
 CONF_DIR=/etc/otguard
 CONF=$CONF_DIR/otguard.conf
 LOGDIR=/var/log/otguard
@@ -269,9 +269,10 @@ write_config() {
   # calibragem PPS: assume ~50 pkt/s por player (Tibia PvP/PvM ativo).
   # Validado em campo: server de 630 players ~25k pps reais; players*50 ~= 31500.
   norm=$(( W_PEAK * 50 ))                       # trafego "normal de pico" estimado
-  w_pps=$(( norm * 2 ));   [ "$w_pps"   -lt 5000  ] && w_pps=5000     # WARN: 2x normal
-  a_pps=$(( norm * 4 ));   [ "$a_pps"   -lt 15000 ] && a_pps=15000    # ATAQUE: 4x normal
-  pps_lim=$(( norm * 3 )); [ "$pps_lim" -lt 10000 ] && pps_lim=10000  # captura: 3x normal
+  w_pps=$(( norm * 2 ));   [ "$w_pps"   -lt 5000  ] && w_pps=5000     # WARN: 2x normal (amarelo mon)
+  a_pps=$(( norm * 4 ));   [ "$a_pps"   -lt 15000 ] && a_pps=15000    # ATAQUE: 4x normal (vermelho mon)
+  # captura + auto-lockdown: 10% acima do vermelho do mon (so dispara apos zona de ataque sustentada)
+  pps_lim=$(( a_pps + a_pps / 10 )); [ "$pps_lim" -lt 16500 ] && pps_lim=16500
   # calibragem CONNTRACK: ~3 conexoes TCP por char (login + jogo + buffer).
   ct_norm=$(( W_PEAK * 3 ))
   w_ct=$(( ct_norm * 5  )); [ "$w_ct"   -lt 1000 ] && w_ct=1000       # WARN:  5x normal
@@ -307,6 +308,17 @@ SYN_GLOBAL_RATE=$syn_g_rate
 SYN_GLOBAL_BURST=$syn_g_burst
 SYN_PER_IP_RATE=$syn_p_rate
 SYN_PER_IP_BURST=$syn_p_burst
+# DATA-flood por IP (apos handshake): pega flood PSH/ACK que vaza por ESTABLISHED.
+# Tibia legitimo: ~50 pps casual, bot "auto 1 xxx" em farm intenso pode atingir ~1000 pps.
+# Burst em entrada de cidade/batalha: ate ~2000 pps por uns segundos.
+# Acima de PKT_PER_IP_RATE sustentado = atacante: ban automatico no otguard_bl por BAN_SECS.
+PKT_PER_IP_RATE=1500
+PKT_PER_IP_BURST=2500
+BAN_SECS=3600
+# auto-lockdown quando watch dispara ataque: pausa novos logins por LOCKDOWN_SECS
+# (players ESTABLISHED nao sao afetados — sobem pela regra ctstate ACCEPT)
+AUTO_LOCKDOWN=sim
+LOCKDOWN_SECS=300
 # captura + alerta (watch.sh)
 PPS_LIMIT=$pps_lim
 CT_LIMIT=$ct_lim
@@ -346,6 +358,13 @@ BL=/etc/otguard/blocklist.ipset
 if [ -f "$BL" ]; then ipset restore -exist -file "$BL"
 else ipset create -exist otguard_bl hash:ip timeout 86400 maxelem 262144; fi
 iptables -t raw -F PREROUTING
+# loopback sempre bypass: senao curl/healthcheck/self-call do nginx/php travam
+iptables -t raw -A PREROUTING -i lo -j ACCEPT
+# whitelist dinamica de players: marca IPs com conexao ESTABLISHED no recent list "otg_players"
+# (timeout via xt_recent). Usado por otguard-lockdown pra nao dropar quem ja jogou recentemente.
+# Idempotente: -C primeiro, so insere se nao existir.
+TR="-p tcp -m multiport --dports $PORTS_CSV -m conntrack --ctstate ESTABLISHED -m recent --set --name otg_players --rsource"
+iptables -t mangle -C PREROUTING $TR 2>/dev/null || iptables -t mangle -I PREROUTING 1 $TR
 for a in $ADMIN_IPS; do
   [ -n "$a" ] && iptables -t raw -A PREROUTING -s "$a" -p tcp -m multiport --dports "$PORTS_CSV" -j ACCEPT
 done
@@ -358,6 +377,18 @@ iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m
   --hashlimit-name otg_g --hashlimit-mode dstport --hashlimit-above "${SGR}/sec" --hashlimit-burst "$SGB" -j DROP
 iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" --syn -m hashlimit \
   --hashlimit-name otg_s --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above "${SPR}/min" --hashlimit-burst "$SPB" -j DROP
+# data-flood por IP (apos handshake): IP que excede PKT_PER_IP_RATE pps -> auto-ban no
+# otguard_bl por BAN_SECS. Proximos pacotes dele caem na regra DROP otguard_bl acima
+# (O(1), antes do conntrack). Pega flood PSH/ACK que vaza por ctstate ESTABLISHED.
+PPR=${PKT_PER_IP_RATE:-1500}; PPB=${PKT_PER_IP_BURST:-2500}; BS=${BAN_SECS:-3600}
+iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" -m hashlimit \
+  --hashlimit-name otg_pkt --hashlimit-mode srcip --hashlimit-srcmask 32 \
+  --hashlimit-above "${PPR}/sec" --hashlimit-burst "$PPB" \
+  -j SET --add-set otguard_bl src --exist --timeout "$BS"
+# e dropa o pacote atual que disparou (senao o primeiro "vaza" antes do bl pegar)
+iptables -t raw -A PREROUTING -p tcp -m multiport --dports "$PORTS_CSV" -m hashlimit \
+  --hashlimit-name otg_pkt2 --hashlimit-mode srcip --hashlimit-srcmask 32 \
+  --hashlimit-above "${PPR}/sec" --hashlimit-burst "$PPB" -j DROP
 # protecao do site: 80/443 so da Cloudflare (opcional, com fail-safe)
 ip6tables -t raw -F PREROUTING 2>/dev/null
 if [ "$CF_FILTER" = sim ]; then
@@ -396,10 +427,12 @@ if curl -fsS -m 25 https://www.cloudflare.com/ips-v4 -o "$tmp" 2>/dev/null && [ 
   ipset create -exist otguard_cf hash:net
   ipset create -exist otguard_cf_new hash:net
   ipset flush otguard_cf_new
-  while read -r n; do [ -n "$n" ] && ipset add -exist otguard_cf_new "$n"; done < "$tmp"
+  # IFS= e "|| [ -n "$n" ]" garantem ler a ULTIMA linha mesmo sem \n final (CF retorna sem)
+  while IFS= read -r n || [ -n "$n" ]; do [ -n "$n" ] && ipset add -exist otguard_cf_new "$n"; done < "$tmp"
   ipset swap otguard_cf_new otguard_cf
   ipset destroy otguard_cf_new
-  logger -t otguard-cf "ranges IPv4 da Cloudflare atualizados"
+  n4=$(ipset list otguard_cf 2>/dev/null | awk '/Number of entries/{print $4}')
+  logger -t otguard-cf "ranges IPv4 da Cloudflare atualizados ($n4 ranges)"
 else
   logger -t otguard-cf "FALHA ao baixar ranges IPv4 da Cloudflare"
 fi
@@ -407,10 +440,11 @@ if curl -fsS -m 25 https://www.cloudflare.com/ips-v6 -o "$tmp" 2>/dev/null && [ 
   ipset create -exist otguard_cf6 hash:net family inet6
   ipset create -exist otguard_cf6_new hash:net family inet6
   ipset flush otguard_cf6_new
-  while read -r n; do [ -n "$n" ] && ipset add -exist otguard_cf6_new "$n"; done < "$tmp"
+  while IFS= read -r n || [ -n "$n" ]; do [ -n "$n" ] && ipset add -exist otguard_cf6_new "$n"; done < "$tmp"
   ipset swap otguard_cf6_new otguard_cf6
   ipset destroy otguard_cf6_new
-  logger -t otguard-cf "ranges IPv6 da Cloudflare atualizados"
+  n6=$(ipset list otguard_cf6 2>/dev/null | awk '/Number of entries/{print $4}')
+  logger -t otguard-cf "ranges IPv6 da Cloudflare atualizados ($n6 ranges)"
 else
   logger -t otguard-cf "FALHA ao baixar ranges IPv6 da Cloudflare"
 fi
@@ -467,6 +501,12 @@ capture() {
   ts=$(date +%Y%m%d-%H%M%S)
   rep="$OUTDIR/report-$ts.txt"; pcap="$OUTDIR/capture-$ts.pcap"; csv="$OUTDIR/pps-$ts.csv"
   logger -t otguard-watch "ATAQUE ($cr) -> capturando em $OUTDIR"
+  # auto-lockdown: pausa NOVAS conexoes em PORTS durante o ataque
+  # (players ja ESTABLISHED seguem normais pela regra ctstate ACCEPT)
+  if [ "$AUTO_LOCKDOWN" = sim ] && [ -x /usr/local/sbin/otguard-lockdown ]; then
+    /usr/local/sbin/otguard-lockdown on "${LOCKDOWN_SECS:-300}" >/dev/null 2>&1 \
+      && logger -t otguard-watch "auto-lockdown ativado por ${LOCKDOWN_SECS:-300}s"
+  fi
   notify_discord "$cr" "$cp" "$cc" "$cs" "$rep" &
   {
     echo "# OTGuard — captura automatica de evidencia de DDoS"
@@ -699,9 +739,98 @@ while :; do
   else sleep 1; fi
 done
 OTG_MON
+  cat > "$sd/otguard-lockdown" <<'OTG_LOCK'
+#!/bin/bash
+# otguard-lockdown — durante ataque, dropa SYN novos de IPs DESCONHECIDOS.
+# IPs que tiveram conexao ESTABLISHED nas portas do jogo nos ultimos
+# WHITELIST_SECS (default 3600s = 1h) estao no recent list "otg_players"
+# (populado pela regra mangle PREROUTING --set, via otguard-mitigacao.sh)
+# e PASSAM normalmente. Conexoes ja ESTABLISHED tambem nao sao afetadas
+# (regra "ctstate RELATED,ESTABLISHED -j ACCEPT" vem antes na chain).
+#
+# Auto-ban data-flood (raw PREROUTING) continua ativo: IP whitelisted que
+# flodar +PKT_PER_IP_RATE pps cai no otguard_bl e e dropado mesmo assim.
+#
+# uso:
+#   otguard-lockdown on [segundos]   liga (padrao 300s); auto-off via systemd-run
+#   otguard-lockdown off             desliga
+#   otguard-lockdown status          mostra estado + tamanho do whitelist
+
+set -e
+. /etc/otguard/otguard.conf 2>/dev/null
+PORTS_CSV="${PORTS_CSV:-7171,7172}"
+WHITELIST_SECS="${WHITELIST_SECS:-3600}"
+
+CHAIN="ufw-before-input"
+COMMENT="otguard-lockdown"
+POS=7
+AUTOFF_UNIT="otguard-lockdown-autoff.timer"
+
+active() {
+  iptables -C "$CHAIN" -p tcp -m multiport --dports "$PORTS_CSV" --syn \
+    -m recent ! --rcheck --seconds "$WHITELIST_SECS" --name otg_players --rsource \
+    -m comment --comment "$COMMENT" -j DROP 2>/dev/null
+}
+
+case "${1:-}" in
+  on)
+    DURATION="${2:-300}"
+    if active; then
+      echo "lockdown ja estava ATIVO"
+    else
+      iptables -I "$CHAIN" "$POS" -p tcp -m multiport --dports "$PORTS_CSV" --syn \
+        -m recent ! --rcheck --seconds "$WHITELIST_SECS" --name otg_players --rsource \
+        -m comment --comment "$COMMENT" -j DROP
+      n=$(wc -l < /proc/net/xt_recent/otg_players 2>/dev/null || echo 0)
+      logger -t otguard-lockdown "ATIVADO (duracao ${DURATION}s, whitelist=$n IPs em otg_players)"
+      echo "lockdown ATIVO — SYN de IPs nunca vistos nos ultimos ${WHITELIST_SECS}s sao dropados"
+      echo "whitelist atual: $n IPs (players com ESTAB recente)"
+    fi
+    systemctl stop "$AUTOFF_UNIT" 2>/dev/null || true
+    systemd-run --quiet --on-active="${DURATION}s" \
+      --unit="otguard-lockdown-autoff" \
+      /usr/local/sbin/otguard-lockdown off >/dev/null
+    echo "auto-desativa em ${DURATION}s (systemd timer: otguard-lockdown-autoff)"
+    echo "para desativar antes: otguard-lockdown off"
+    ;;
+  off)
+    if active; then
+      iptables -D "$CHAIN" -p tcp -m multiport --dports "$PORTS_CSV" --syn \
+        -m recent ! --rcheck --seconds "$WHITELIST_SECS" --name otg_players --rsource \
+        -m comment --comment "$COMMENT" -j DROP
+      logger -t otguard-lockdown "DESATIVADO"
+      echo "lockdown DESATIVADO"
+    else
+      echo "lockdown ja estava inativo"
+    fi
+    systemctl stop "$AUTOFF_UNIT" 2>/dev/null || true
+    ;;
+  status)
+    if active; then
+      echo "ATIVO"
+      iptables -L "$CHAIN" -n -v --line-numbers 2>/dev/null | grep -E "otguard-lockdown|^Chain" | head -3
+      n=$(wc -l < /proc/net/xt_recent/otg_players 2>/dev/null || echo 0)
+      echo "whitelist: $n IPs no otg_players (timeout ${WHITELIST_SECS}s)"
+      systemctl list-timers otguard-lockdown-autoff --no-pager 2>/dev/null | head -3
+    else
+      echo "INATIVO"
+      n=$(wc -l < /proc/net/xt_recent/otg_players 2>/dev/null || echo 0)
+      echo "whitelist: $n IPs no otg_players (pre-marcados pra um eventual lockdown)"
+    fi
+    ;;
+  *)
+    echo "uso: $0 {on [segundos]|off|status}"
+    echo "  on  — drop SYN novos de IPs fora do otg_players (default 300s, auto-off)"
+    echo "  off — remove o lockdown"
+    exit 1
+    ;;
+esac
+OTG_LOCK
+
   # substitui placeholders dependentes da versao em runtime (heredoc 'quoted' nao expande)
   sed -i "s/__OTG_VER__/$OTG_VER/g" "$bd/otguard-mon"
-  chmod +x "$sd/otguard-mitigacao.sh" "$sd/otguard-cf-update.sh" "$sd/otguard-watch.sh" "$sd/otguard-live.sh" "$bd/otguard-mon"
+  chmod +x "$sd/otguard-mitigacao.sh" "$sd/otguard-cf-update.sh" "$sd/otguard-watch.sh" \
+           "$sd/otguard-live.sh" "$sd/otguard-lockdown" "$bd/otguard-mon"
 }
 
 emit_units() {
@@ -756,9 +885,9 @@ ExecStart=/usr/local/sbin/otguard-cf-update.sh
 OTG_U4
   cat > /etc/systemd/system/otguard-cfupdate.timer <<'OTG_U5'
 [Unit]
-Description=OTGuard: atualizacao semanal dos ranges da Cloudflare
+Description=OTGuard: atualizacao diaria dos ranges da Cloudflare
 [Timer]
-OnCalendar=weekly
+OnCalendar=daily
 Persistent=true
 RandomizedDelaySec=1h
 [Install]
@@ -768,12 +897,25 @@ OTG_U5
 
 # --------------------------------------------------------------------------
 apply() {
+  # xt_recent default ip_list_tot=100 e baixo demais p/ peak de centenas de players.
+  # Persistir 4096 via modprobe.d garante o limite no boot.
+  if [ ! -f /etc/modprobe.d/xt_recent.conf ] || ! grep -q 'ip_list_tot=4096' /etc/modprobe.d/xt_recent.conf; then
+    echo "options xt_recent ip_list_tot=4096" > /etc/modprobe.d/xt_recent.conf
+    # recarrega o modulo p/ pegar o novo limite (nao quebra: nao ha regras usando antes do otguard-mitigacao rodar)
+    modprobe -r xt_recent 2>/dev/null && modprobe xt_recent 2>/dev/null || true
+    ok "xt_recent: ip_list_tot=4096 (suporta peak de centenas de players no whitelist)"
+  fi
   cat > /etc/sysctl.d/99-otguard.conf <<'OTG_SYS'
 # OTGuard — tuning anti-DDoS
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_retries2 = 10
+net.ipv4.tcp_abort_on_overflow = 1
 net.netfilter.nf_conntrack_max = 2097152
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 10
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_loose = 0
 OTG_SYS
   sysctl -q -p /etc/sysctl.d/99-otguard.conf >/dev/null 2>&1
   ok "ajustes de rede (sysctl) aplicados"
@@ -973,11 +1115,18 @@ uninstall() {
   rm -f /etc/systemd/system/otguard-cfupdate.service /etc/systemd/system/otguard-cfupdate.timer
   iptables -t raw -F PREROUTING 2>/dev/null
   ip6tables -t raw -F PREROUTING 2>/dev/null
+  # remove regra mangle do whitelist (--set otg_players) — idempotente
+  iptables -t mangle -D PREROUTING -p tcp -m multiport --dports 7171,7172 -m conntrack --ctstate ESTABLISHED -m recent --set --name otg_players --rsource 2>/dev/null || true
+  rm -f /etc/modprobe.d/xt_recent.conf
   ipset destroy otguard_bl  2>/dev/null
   ipset destroy otguard_cf  2>/dev/null
   ipset destroy otguard_cf6 2>/dev/null
+  # garante que lockdown nao fique pendurado no iptables ao remover
+  [ -x /usr/local/sbin/otguard-lockdown ] && /usr/local/sbin/otguard-lockdown off >/dev/null 2>&1 || true
+  systemctl stop otguard-lockdown-autoff.timer otguard-lockdown-autoff.service >/dev/null 2>&1 || true
   rm -f /usr/local/sbin/otguard-mitigacao.sh /usr/local/sbin/otguard-cf-update.sh \
         /usr/local/sbin/otguard-watch.sh /usr/local/sbin/otguard-live.sh \
+        /usr/local/sbin/otguard-lockdown \
         /usr/local/bin/otguard-mon /etc/sysctl.d/99-otguard.conf \
         /usr/local/bin/otguard /usr/local/sbin/otguard
   rm -rf "$CONF_DIR"
@@ -993,7 +1142,8 @@ selftest() {
   done
   if command -v bash >/dev/null 2>&1; then
     if bash -n "$d/otguard-mon" 2>/dev/null; then ok "otguard-mon"; else err "otguard-mon — erro"; fail=1; fi
-  else warn "bash ausente — otguard-mon nao checado"; fi
+    if bash -n "$d/otguard-lockdown" 2>/dev/null; then ok "otguard-lockdown"; else err "otguard-lockdown — erro"; fail=1; fi
+  else warn "bash ausente — otguard-mon/otguard-lockdown nao checados"; fi
   rm -rf "$d"
   say ""
   [ "$fail" = 0 ] && ok "pacote OTGuard integro." || die "pacote com erro de sintaxe."
